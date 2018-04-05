@@ -1,34 +1,42 @@
 const fs = require('fs');
 const ffmpeg = require('ffmpeg');
 const BlinkDiff = require('blink-diff');
-const cmd = require('node-cmd');
 
 const VIDEOS_DIR = './videos';
 const CYCLE_DURATION = 10;
 
-console.log(`Reading files from "${VIDEOS_DIR}"...`);
-let files = fs.readdirSync(VIDEOS_DIR);
+(async () => {
+    try {
+        console.log(`Reading files from "${VIDEOS_DIR}"...`);
 
-console.log(`The content of "${VIDEOS_DIR}":\n`, files);
+        const files = fs.readdirSync(VIDEOS_DIR);
+
+        console.log(`The content of "${VIDEOS_DIR}" \n ${files}`);
+
+        for (file of files) {
 
 
-async function getImages() {
-    for (file of files) {
-        let filepath = `${VIDEOS_DIR}/${file}`;
-        const tempDir = `${VIDEOS_DIR}/${file}_temp`;
-        fs.mkdirSync(tempDir);
+            if (!file.split('.')[1]) {
+                continue;
+            }
 
-        await cmd.run(`ffmpeg -i "${filepath}" -r 0.1 -f image2 "${tempDir}/img%03d.jpg"`);
+            try {
+
+                var process = await new ffmpeg(`${VIDEOS_DIR}/${file}`);
+
+                const frames = await process.fnExtractFrameToJPG(`${VIDEOS_DIR}/temp`, {
+                    frame_rate: 1,
+                    every_n_seconds: 10
+                });
+
+                console.log(`Frames: ${frames}`);
+
+            } catch (error) {
+                console.log(error.message)
+            }
+
+        }
+    } catch (error) {
+        console.log(error.message);
     }
-}
-
-async function compareImages() {
-    await getImages();
-    return('Finished!')
-}
-
-getImages()
-    .then(() => {
-        console.log('Finished!');
-    })
-
+})();
