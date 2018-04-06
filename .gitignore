@@ -1,3 +1,4 @@
+*.flv
 /node_modules/
-/videos/**
+/videos/*
 !/videos/.gitkeep
