@@ -1,14 +1,15 @@
 const log4js = require('log4js');
 const fs = require('fs');
 const ffmpeg = require('ffmpeg');
-const BlinkDiff = require('blink-diff');
-const compare = require('resemblejs/compare');
+const compareImages = require('resemblejs/compareImages');
 const util = require('util');
 const jimp = require('jimp');
 const rmdir = require('rmdir');
+const natsort = require('natsort');
 
 const VIDEOS_DIR = './videos';
 const CYCLE_DURATION = 10;
+const EMPTY_FRAME = './empty.png';
 
 log4js.configure({
     appenders: {
@@ -30,6 +31,22 @@ log4js.configure({
 
 const logger = log4js.getLogger();
 const deleteFile = util.promisify(fs.unlink);
+const readFile = util.promisify(fs.readFile);
+
+async function getDiff(img1, img2) {
+
+    logger.info(`Comparing ${img1} and ${img2}`);
+
+    const options = {
+        outputDiff: false
+    };
+
+    return await compareImages(
+        await readFile(img1),
+        await readFile(img2),
+        options
+    );
+}
 
 async function prepareFiles() {
 
@@ -43,12 +60,12 @@ async function prepareFiles() {
         let filteredFiles = [];
 
         for (file of files) {
-    
+
             // deleting all files that are not videos        
             if (file.search(/gitkeep/) >= 0) {
                 continue;
             } else if (file.search(/_temp/i) >= 0) {
-                rmdir(`${VIDEOS_DIR}/${file}`, function(err) {
+                rmdir(`${VIDEOS_DIR}/${file}`, function (err) {
                     if (!err) {
                         logger.info(`Folder ${file} was removed!`);
                     } else {
@@ -56,22 +73,22 @@ async function prepareFiles() {
                     }
                 });
                 continue;
-            } 
-            
+            }
+
             // renaming all files that contains spaces
             if ((file.search(/_temp/) === -1) && (file.search(/\s+/g) >= 0)) {
                 const oldName = file;
-                file = file.replace(/\s+/g, '_');
-                logger.debug(`New name of ${oldName} is`, file);
-                fs.renameSync(`${VIDEOS_DIR}/${oldName}`, `${VIDEOS_DIR}/${file}`);     
+                file = file.replace(/\s+/g, '-');
+                logger.info(`New name of ${oldName} is`, file);
+                fs.renameSync(`${VIDEOS_DIR}/${oldName}`, `${VIDEOS_DIR}/${file}`);
 
                 filteredFiles.push(file);
-                continue;                
+                continue;
             }
 
             filteredFiles.push(file);
         }
-        
+
         return filteredFiles;
     } catch (error) {
         logger.error(error);
@@ -105,7 +122,6 @@ async function getFrames(video) {
         fs.mkdirSync(filepath);
 
         // making screens with ffmpeg package
-
         const frames = await process.fnExtractFrameToJPG(filepath, {
             frame_rate: 1,
             every_n_seconds: 10
@@ -121,59 +137,53 @@ async function getFrames(video) {
     }
 }
 
-async function compareTwoFrames(frame1, frame2) {
-
-    try {
-        logger.info(`Comparing ${frame1} and ${frame2}`);
-
-        const diff = new BlinkDiff({
-            imageAPath: frame1,
-            imageBPath: frame2,
-    
-            thresholdType: BlinkDiff.THRESHOLD_PERCENT,
-            threshold: 0.005,
-    
-            blockOut: {
-                x: 0,
-                y: 0,
-                wifth: 450,
-                height: 150
-            }
-        });
-
-        logger.debug(diff);
-
-        diff.run((err, res) => {
-            if (err) logger.error(err);
-            result = res;
-
-            return res;
-        })
-
-
-    } catch (error) {
-        logger.fatal(error);
-    }
-}
-
+// the name of function tells enought about it. What else do you need? 
 async function compareFrames(frames) {
     try {
+        let timecodes = [];
+        let startpoint = 0;
+
         console.log('Comparing frames...', );
 
-        for (i = 0; i < frames.length - 1; i++) {
-            logger.trace(await compareTwoFrames(frames[i], frames[i+1]));
+        frames.sort(natsort());
+
+        // at first compare with empty frame to understand where the song begins
+        for (i = 0; i < frames.length; i++) {
+            const result = await getDiff(EMPTY_FRAME, frames[i]);
+            
+            if (result.misMatchPercentage > 0.3) {
+                startpoint = i;
+                break;
+            }
         }
+
+        timecodes.push(startpoint * 10);
+
+        // then compare with other images
+        for (i = startpoint; i < frames.length - 1; i++) {
+            const result = await getDiff(frames[i], frames[i + 1]);
+        
+            if (result.misMatchPercentage > 1) {
+                timecodes.push((i + 1) * 10); // framenumber * 10 = timecode
+            }
+        }
+
+        // end of file
+        timecodes.push(frames.length * 10);
+
+        return timecodes;
+
     } catch (e) {
         logger.fatal(e);
     }
 }
 
-// b`cause blink-diff works only with .png
-async function turnJPGIntoPNG(frameData) {
+// crops image and generates .png from .jpg
+async function cropAndMakePNG(frameData) {
 
     function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
-    }      
+    }
 
     try {
         let frames = [];
@@ -186,11 +196,11 @@ async function turnJPGIntoPNG(frameData) {
                 const filename = frame.slice(20, frame.length - 4);
                 const img = await readFile(frame);
 
-                logger.trace(img);
-
                 const newFrame = `${VIDEOS_DIR}/${frameData.directory}/${filename}.png`;
 
-                img.crop(0, 0, 450, 250);
+                logger.debug(frameData.directory);
+
+                img.crop(85, 150, 200, 45);
                 img.write(newFrame);
 
                 frames.push(newFrame);
@@ -210,17 +220,47 @@ async function turnJPGIntoPNG(frameData) {
     }
 }
 
+async function generateM3U(timecodes, video, directory) {
+    try {
+        logger.info('Generating .m3u file...');
+
+        const writeFile = util.promisify(fs.writeFile);
+        let data = '';
+
+        timecodes.forEach((timecode, i) => {
+            if (i === 0) {
+                data += `#EXTVLCOPT:start-time=${timecode}\n`;
+            } else if (i < timecodes.length - 1) {
+                data += `#EXTVLCOPT:stop-time=${timecode}\n`;
+                data += `../${video}\n`;
+                data += `#EXTVLCOPT:start-time=${timecode}\n`;
+            } else {
+                data += `#EXTVLCOPT:stop-time=${timecode}\n`;
+                data += `../${video}\n`;
+            }
+        });
+
+        await writeFile(`${VIDEOS_DIR}/${directory}/result.m3u`, data);
+
+        logger.log(`~~FILE ${video} HANDLED SUCCESFULLY!~~`);
+    } catch (err) {
+        logger.error(err)
+    }
+}
+
 // main function
 (async () => {
     let videos = await readVideos();
 
     for (video of videos) {
         let framesData = await getFrames(video);
-        logger.info(framesData);
+        const directory = framesData.directory;
 
-        framesData = await turnJPGIntoPNG(framesData);
+        framesData = await cropAndMakePNG(framesData);
 
-        compareFrames(framesData);
+        const timecodes = await compareFrames(framesData);
+
+        generateM3U(timecodes, video, directory);
     }
 
 })()
